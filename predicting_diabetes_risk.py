@@ -14,7 +14,7 @@
 # 
 # 
 
-# In[1]:
+# In[75]:
 
 
 import pandas as pd
@@ -23,12 +23,17 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import keras_tuner as kt
+from keras_tuner.tuners import BayesianOptimization
 from tensorflow import keras
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import *
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn import metrics
+
+from keras.wrappers.scikit_learn import KerasClassifier, KerasRegressor
+import eli5
+from eli5.sklearn import PermutationImportance
 
 
 # In[2]:
@@ -39,7 +44,7 @@ data = pd.read_csv("diabetes_binary_health_indicators_BRFSS2015.csv")
 
 # As a crude first pass, since I am dealing with ordinal and binary data, I can look at how they are related using a Spearman correlation.
 
-# In[3]:
+# In[5]:
 
 
 plt.figure(figsize=(10,10))
@@ -52,7 +57,7 @@ sns.heatmap(data=data.corr(method='spearman'),vmin = -0.2, vmax = 0.4, square=Tr
 # 
 # Since I am predicting a category for labeled data with a relatively large number of samples, I'll try using a simple neural network
 
-# In[4]:
+# In[6]:
 
 
 X = data.drop(['Diabetes_binary'],axis=1)
@@ -62,22 +67,38 @@ y = data['Diabetes_binary']
 X_train, X_test, y_train, y_test = train_test_split(X_sc, y, test_size=0.20, random_state=123)
 
 
-# In[15]:
+# In[51]:
 
 
-n = len(X.columns)
-model = tf.keras.Sequential()
-model.add(tf.keras.Input(shape=(n,)))
-model.add(tf.keras.layers.Dense(n*32,activation='relu'))
-model.add(tf.keras.layers.Dense(n*16,activation='relu'))
-model.add(tf.keras.layers.Dense(1,activation='sigmoid'))
-model.summary()
-model.compile(loss='mse',optimizer='adam',metrics=['accuracy'])
-history = model.fit(X_train, y_train, validation_split = 0.33,epochs=20, batch_size = 256,verbose=1)
-test_loss, test_acc = model.evaluate(X_test, y_test)
+def build_model(hp):
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.Dense(hp.Int("input_units",32,512,32),activation='relu'))
+    for i in range(hp.Int("n_layers",1,2)):
+        model.add(tf.keras.layers.Dense(hp.Int(f"layer_{i}",32,512,32),activation='relu'))
+    model.add(tf.keras.layers.Dense(1,activation='sigmoid'))
+    model.compile(loss='mse',optimizer='adam',metrics=['accuracy'])
+    return model
+
+tuner = BayesianOptimization(
+    build_model,
+    objective = "val_accuracy",
+    max_trials = 10,
+    executions_per_trial = 1,
+    directory = "diabetes_risk",
+    overwrite=True)
+
+tuner.search(x=X_train,y=y_train,epochs=1,batch_size=256,verbose=1,validation_split=0.33)
 
 
-# In[16]:
+# In[56]:
+
+
+print(tuner.get_best_hyperparameters()[0].values)
+best_model = tuner.get_best_models()[0]
+history = best_model.fit(X_train, y_train, validation_split = 0.33,epochs=6, batch_size = 256)
+
+
+# In[57]:
 
 
 fig = plt.figure(figsize=(12,5))
@@ -94,10 +115,10 @@ plt.xlabel('Epochs')
 
 # The accuracy determined with the validation set sits at about 0.86 for all of the epochs, which appears OK. But let's look at the confusion matrix.
 
-# In[17]:
+# In[58]:
 
 
-y_pred = model.predict(X_test)
+y_pred = best_model.predict(X_test)
 conf_mat = metrics.confusion_matrix(y_test,np.round(y_pred))
 sns.heatmap(conf_mat,annot=True,cmap='magma')
 plt.title('Confusion Matrix')
@@ -107,7 +128,7 @@ plt.ylabel("Actual")
 
 # Even though the accuracy at first seems "decent", the confusion matrix is bad. There are just as many false positives as there are true positives. The chance of telling somebody that they have diabetes when they actually don't is equally likely. If we just created a model predicting that all the results were negative, what would we get?
 
-# In[18]:
+# In[36]:
 
 
 np.sum(y==0)/np.size(y)
@@ -115,7 +136,7 @@ np.sum(y==0)/np.size(y)
 
 # This suggests that our fancy neural network model is not great at all, doing only 0.5% better than the most naive model imaginable. Perhaps the issue is that the model is only good at predicting true negatives, because that is usually what it sees. This is an intrinsic flaw in the input dataset, because it contains mostly negatives. To fix this, I need to rebalance it. The Kaggle page already provides this dataset, but I want to try doing it myself.
 
-# In[19]:
+# In[37]:
 
 
 diabetes_group = data[data['Diabetes_binary']==1]
@@ -125,7 +146,7 @@ diabetes_group_oversampled = diabetes_group.sample(len(nodiabetes_group),replace
 data_oversampled = pd.concat([diabetes_group_oversampled,nodiabetes_group],axis=0)
 
 
-# In[20]:
+# In[38]:
 
 
 fig = plt.figure(figsize=(12,5))
@@ -137,7 +158,7 @@ data_oversampled['Diabetes_binary'].value_counts().plot(kind='bar', title='After
 
 # This is much better. Let's see if a neural network works better now....
 
-# In[21]:
+# In[59]:
 
 
 X_os = data_oversampled.drop(['Diabetes_binary'],axis=1)
@@ -145,19 +166,30 @@ X_os_sc = MinMaxScaler().fit_transform(X_os)
 y_os = data_oversampled['Diabetes_binary']
 X_os_train, X_os_test, y_os_train, y_os_test =train_test_split(X_os_sc, y_os, test_size=0.20, random_state=123)
 
-n = len(X.columns)
-model = tf.keras.Sequential()
-model.add(tf.keras.Input(shape=(n,)))
-model.add(tf.keras.layers.Dense(n*32,activation='relu'))
-model.add(tf.keras.layers.Dense(n*16,activation='relu'))
-model.add(tf.keras.layers.Dense(1,activation='sigmoid'))
-model.summary()
-model.compile(loss='mse',optimizer='adam',metrics=['accuracy'])
-history = model.fit(X_os_train, y_os_train, validation_split = 0.33,epochs=100, batch_size = 256,verbose=1)
-test_loss, test_acc = model.evaluate(X_os_test, y_os_test)
+tuner_os = BayesianOptimization(
+    build_model,
+    objective = "val_accuracy",
+    max_trials = 10,
+    executions_per_trial = 1,
+    directory = "diabetes_risk",
+    overwrite=True)
 
 
-# In[22]:
+# In[61]:
+
+
+tuner_os.search(x=X_os_train,y=y_os_train,epochs=50,batch_size=1024,validation_split=0.33)
+
+
+# In[64]:
+
+
+print(tuner_os.get_best_hyperparameters()[0].values)
+best_model_os = tuner_os.get_best_models()[0]
+history = best_model_os.fit(X_os_train, y_os_train, validation_split = 0.33,epochs=200, batch_size = 2048)
+
+
+# In[65]:
 
 
 fig = plt.figure(figsize=(12,5))
@@ -172,10 +204,10 @@ plt.ylabel('Validation accuracy')
 plt.xlabel('Epochs')
 
 
-# In[30]:
+# In[68]:
 
 
-y_os_pred = model.predict(X_os_test)
+y_os_pred = best_model_os.predict(X_os_test)
 conf_mat = metrics.confusion_matrix(y_os_test,np.round(y_os_pred))
 sns.heatmap(conf_mat,annot=True,cmap='magma')
 plt.title('Confusion Matrix')
@@ -183,16 +215,12 @@ plt.xlabel("Prediction")
 plt.ylabel("Actual")
 
 
-# In[24]:
+# In[73]:
 
 
-test_loss
-
-
-# In[25]:
-
-
-test_acc
+test_loss, test_acc = best_model_os.evaluate(X_os_test, y_os_test)
+print("Loss: %s" % test_loss)
+print("Accuracy: %s" % test_acc)
 
 
 # This is a much better set of results. True positives and negatives are much more common than false positives and negatives. This is a much better score than the naive method used before would predict: 0.5 (since I artificially oversampled). From this, we can conclude that it is possible to predict diabetes relatively well with survey questions, provided that the dataset is over or undersampled such that the two outcomes are equally probable.
@@ -203,39 +231,21 @@ test_acc
 # 
 # I use the eli5 package to accomplish this, which is supposed to work better with sklearn models. I created a simple wrapper to get it to cooperate quickly.
 
-# In[42]:
+# In[80]:
 
 
-from keras.wrappers.scikit_learn import KerasClassifier, KerasRegressor
-import eli5
-from eli5.sklearn import PermutationImportance
-
-def diabetes_model():
-    n = len(X.columns)
-    model = tf.keras.Sequential()
-    model.add(tf.keras.Input(shape=(n,)))
-    model.add(tf.keras.layers.Dense(n*32,activation='relu'))
-    model.add(tf.keras.layers.Dense(n*16,activation='relu'))
-    model.add(tf.keras.layers.Dense(1,activation='sigmoid'))
-    model.compile(loss='mse',optimizer='adam',metrics=['accuracy'])
-    return model
+my_model = KerasRegressor(build_fn= lambda: best_model_os)
+history = my_model.fit(X_os_train, y_os_train, validation_split = 0.33,epochs=200, batch_size = 2048)
 
 
-# In[43]:
-
-
-my_model = KerasRegressor(build_fn=diabetes_model)
-history = my_model.fit(X_os_train, y_os_train, validation_split = 0.33,epochs=100, batch_size = 256,verbose=1)
-
-
-# In[44]:
+# In[81]:
 
 
 perm = PermutationImportance(my_model, random_state=1).fit(X_os_test,y_os_test)
 eli5.show_weights(perm, feature_names = X_os_test.columns.tolist())
 
 
-# In[48]:
+# In[82]:
 
 
 eli5.show_weights(perm, feature_names = X.columns.tolist())
@@ -243,7 +253,7 @@ eli5.show_weights(perm, feature_names = X.columns.tolist())
 
 # The importance of each feature seems to gradually decrease; there is no obvious cutoff. This result agrees with the correlation matrix we calculated above: there were no obvious features that stood above the rest. Let's try arbitrarily cutting off the data at the point where the relatively weight is about half of the top value. We can visualize these features easily with seaborn.
 
-# In[104]:
+# In[83]:
 
 
 fig = plt.figure(figsize=(12,6))
@@ -279,25 +289,29 @@ X_sub = X_os[['HighBP','BMI','GenHlth','Age','Income','HighChol','Sex','PhysHlth
 X_sub_sc = MinMaxScaler().fit_transform(X_sub)
 X_sub_train, X_sub_test, y_sub_train, y_sub_test = train_test_split(X_sub_sc, y_os, test_size=0.20, random_state=123)
 
-def simple_diabetes_model():
-    n = len(X_sub.columns)
-    model = tf.keras.Sequential()
-    model.add(tf.keras.Input(shape=(n,)))
-    model.add(tf.keras.layers.Dense(n*32,activation='relu'))
-    model.add(tf.keras.layers.Dense(n*16,activation='relu'))
-    model.add(tf.keras.layers.Dense(1,activation='sigmoid'))
-    model.compile(loss='mse',optimizer='adam',metrics=['accuracy'])
-    return model
-
 
 # In[89]:
 
 
-my_simple_model = KerasRegressor(build_fn=simple_diabetes_model)
-history = my_simple_model.fit(X_sub_train, y_sub_train, validation_split = 0.33,epochs=100, batch_size = 256,verbose=1)
+tuner_sub = BayesianOptimization(
+    build_model,
+    objective = "val_accuracy",
+    max_trials = 10,
+    executions_per_trial = 1,
+    directory = "diabetes_risk",
+    overwrite=True)
+tuner_sub.search(x=X_sub_train,y=y_sub_train,epochs=150,batch_size=2048,verbose=1,validation_split=0.33)
 
 
 # In[90]:
+
+
+print(tuner_sub.get_best_hyperparameters()[0].values)
+best_model_sub = tuner_sub.get_best_models()[0]
+history = best_model_sub.fit(X_sub_train, y_sub_train, validation_split = 0.33,epochs=200, batch_size = 2048)
+
+
+# In[91]:
 
 
 fig = plt.figure(figsize=(12,5))
@@ -312,7 +326,26 @@ plt.ylabel('Validation accuracy')
 plt.xlabel('Epochs')
 
 
-# Using half the features, we can get a model with about 80% accuracy. The accuracy decreased by about 5%, which is not bad, considering that the features we removed had significant weight values. 
+# In[94]:
+
+
+y_sub_pred = best_model_sub.predict(X_sub_test)
+conf_mat = metrics.confusion_matrix(y_sub_test,np.round(y_sub_pred))
+sns.heatmap(conf_mat,annot=True,cmap='magma')
+plt.title('Confusion Matrix')
+plt.xlabel("Prediction")
+plt.ylabel("Actual")
+
+
+# In[96]:
+
+
+test_loss, test_acc = best_model_sub.evaluate(X_sub_test, y_sub_test)
+print("Loss: %s" % test_loss)
+print("Accuracy: %s" % test_acc)
+
+
+# Using half the features, we can get a model with about 86% accuracy. The accuracy decreased by about 3%, which is not bad, considering that the features we removed had significant weight values. 
 
 # In[ ]:
 
